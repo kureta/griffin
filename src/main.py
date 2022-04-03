@@ -1,34 +1,27 @@
 from functools import partial
 from pathlib import Path
-from typing import Callable, List
 
 import librosa
 import numpy as np
 import pytorch_lightning as pl
 import torch
-import torchaudio.functional as AF
 import torch.nn as nn
-import torch.nn.functional as F
+import torchaudio.functional as AF
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
 
-def normalize_spectrum(s):
-    return (s - np.mean(s, axis=0, keepdims=True)) / np.std(s, axis=0, keepdims=True)
-
-
 def amp_to_db(s):
-    return librosa.amplitude_to_db(s, amin=1e-6, top_db=96)
-
-
-def unitify(s):
-    return s / 1024
+    return AF.amplitude_to_DB(s, 20., 1e-6, 1., 96.)
 
 
 def pre_process_file(data_path, sample_rate, n_fft, hop_length, f):
     y, _ = librosa.load(f, mono=True, sr=sample_rate)
+    # calculate spectrum
     s = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop_length))
+    # normalize (assuming hann window)
+    s = s / (n_fft / 2)
     # remove zero offset
     s = s[1:, :]
     np.save(str(data_path / f'{str(f.stem)}.npy'), s)
@@ -47,29 +40,13 @@ def prepare_intermediate_data(folder_path: Path,
     # sort for reproducible ordering
     files.sort()
     func = partial(pre_process_file, data_path, sample_rate, n_fft, hop_length)
-    process_map(func, files, max_workers=8)
+    process_map(func, files, max_workers=8, chunksize=10)
 
     return data_path
 
 
-class AudioDataModule(pl.LightningDataModule):
-    def prepare_data(self):
-        """Generate all relevant features from a folder of wav files and save them to file."""
-
-    def setup(self):
-        """Instantiate train and validation datasets and setup any transforms."""
-
-    def train_dataloader(self):
-        """Create and return training dataloader."""
-
-    def val_dataloader(self):
-        """Create and return validation dataloader."""
-
-
 class AudioDataset(Dataset):
     def __init__(self, folder_path: Path,
-                 input_transforms: List[Callable] = None,
-                 output_transforms: List[Callable] = None,
                  sample_rate: int = 44100, n_fft: int = 2048, hop_length: int = 512):
         data_path = prepare_intermediate_data(folder_path, sample_rate, n_fft, hop_length)
 
@@ -80,20 +57,12 @@ class AudioDataset(Dataset):
             spectra.append(np.load(f))
 
         self.dataset = np.concatenate(spectra, axis=1)
-        self.input_transforms = [] if input_transforms is None else input_transforms
-        self.output_transforms = [] if output_transforms is None else output_transforms
 
     def __len__(self):
         return self.dataset.shape[1]
 
     def __getitem__(self, index):
-        x = self.dataset[:, index]
-        for t in self.input_transforms:
-            x = t(x)
-        y = self.dataset[:, index]
-        for t in self.output_transforms:
-            y = t(y)
-        return x, y
+        return self.dataset[:, index]
 
 
 class Encoder(nn.Module):
@@ -104,7 +73,7 @@ class Encoder(nn.Module):
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
                 nn.Linear(in_, out_),
-                nn.InstanceNorm1d(out_),
+                # nn.InstanceNorm1d(out_),
                 nn.LeakyReLU(0.2)
             ))
         self.enc = nn.Sequential(*layers)
@@ -126,23 +95,24 @@ class Decoder(nn.Module):
         super().__init__()
         self.complication = nn.Sequential(*[nn.Linear(64, 64)] * 4)
 
-        layer_sizes = [64, 128, 256, 512]
+        layer_sizes = [64, 128, 256, 512, 1024]
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
                 nn.Linear(in_, out_),
-                nn.InstanceNorm1d(out_),
+                # nn.InstanceNorm1d(out_),
                 nn.LeakyReLU(0.2)
             ))
-        layers.append(nn.Linear(512, 1024))
+
         self.dec = nn.Sequential(*layers)
+        self.mean = nn.Linear(1024, 1024)
 
     def forward(self, z):
         w = self.complication(z)
         x_hat = self.dec(w)
-        x_hat = torch.sigmoid(x_hat)
-        # TODO: try DDSP's modified sigmoid
-        return x_hat
+        mean = self.mean(x_hat)
+
+        return torch.sigmoid(mean)
 
 
 class VAE(nn.Module):
@@ -150,11 +120,10 @@ class VAE(nn.Module):
         super().__init__()
         self.encoder = Encoder()
         self.decoder = Decoder()
-        self.log_scale = nn.Parameter(torch.Tensor([1e-6]))
+        self.log_scale = nn.Parameter(torch.Tensor([1e-7]))
 
-    def gaussian_likelihood(self, x_hat, x):
+    def likelihood(self, mean, x):
         scale = torch.exp(self.log_scale)
-        mean = x_hat
         dist = torch.distributions.Normal(mean, scale)
 
         # measure prob of seeing image under p(x|z)
@@ -180,16 +149,16 @@ class VAE(nn.Module):
         return kl
 
     def forward(self, x):
-        mean, log_var = self.encoder(x)
+        mu, log_var = self.encoder(x)
 
         # sample z from q
         std = torch.exp(log_var / 2)
-        q = torch.distributions.Normal(mean, std)
+        q = torch.distributions.Normal(mu, std)
         z = q.rsample()
 
-        y = self.decoder(z)
+        x_hat = self.decoder(z)
 
-        return y, mean, std, z
+        return x_hat, mu, std, z
 
 
 class LitVAE(pl.LightningModule):
@@ -198,13 +167,10 @@ class LitVAE(pl.LightningModule):
         self.vae = VAE()
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat, mean, std, z = self.vae(x)
+        x = batch
+        x_hat, mean, std, z = self.vae(x)
 
-        # both_y_hats = torch.cat([AF.amplitude_to_DB(y_hat, 20., 1e-6, 1., 96.), y_hat], dim=1)
-        # both_xs = torch.cat([AF.amplitude_to_DB(y, 20., 1e-6, 1., 96.), x], dim=1)
-
-        recon_loss = self.vae.gaussian_likelihood(y_hat, y)
+        recon_loss = self.vae.likelihood(x_hat, x)
 
         kl = self.vae.kl_divergence(z, mean, std)
 
@@ -215,19 +181,18 @@ class LitVAE(pl.LightningModule):
             'elbo': elbo,
             'kl_loss': kl.mean(),
             'recon_loss': recon_loss.mean(),
+            'log_scale': self.vae.log_scale,
         })
 
         return elbo
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         return optimizer
 
 
 def main():
-    dataset = AudioDataset(Path('/home/kureta/Music/violin/Violin Samples'),
-                           input_transforms=[unitify],
-                           output_transforms=[unitify])
+    dataset = AudioDataset(Path('/home/kureta/Music/cello/Cello Samples'))
     loader = DataLoader(dataset, batch_size=512, shuffle=True, num_workers=8, pin_memory=True)
     vae = LitVAE()
 
