@@ -99,7 +99,7 @@ class AudioDataset(Dataset):
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        layer_sizes = [1024, 512, 256, 128]
+        layer_sizes = [1024, 512, 256, 128, 64]
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
@@ -108,13 +108,15 @@ class Encoder(nn.Module):
                 nn.LeakyReLU(0.2)
             ))
         self.enc = nn.Sequential(*layers)
-        self.mean = nn.Linear(128, 64)
-        self.log_var = nn.Linear(128, 64)
+        self.complication = nn.Sequential(*[nn.Linear(64, 64)] * 4)
+        self.mean = nn.Linear(64, 64)
+        self.log_var = nn.Linear(64, 64)
 
     def forward(self, x):
         z = self.enc(x)
-        mean = self.mean(z)
-        log_var = self.log_var(z)
+        w = self.complication(z)
+        mean = self.mean(w)
+        log_var = self.log_var(w)
 
         return mean, log_var
 
@@ -139,6 +141,7 @@ class Decoder(nn.Module):
         w = self.complication(z)
         x_hat = self.dec(w)
         x_hat = torch.sigmoid(x_hat)
+        # TODO: try DDSP's modified sigmoid
         return x_hat
 
 
@@ -147,21 +150,46 @@ class VAE(nn.Module):
         super().__init__()
         self.encoder = Encoder()
         self.decoder = Decoder()
+        self.log_scale = nn.Parameter(torch.Tensor([1e-6]))
+
+    def gaussian_likelihood(self, x_hat, x):
+        scale = torch.exp(self.log_scale)
+        mean = x_hat
+        dist = torch.distributions.Normal(mean, scale)
+
+        # measure prob of seeing image under p(x|z)
+        log_pxz = dist.log_prob(x)
+        return log_pxz.sum(dim=1)
 
     @staticmethod
-    def reparametrize(mean, log_var: torch.Tensor):
-        var = torch.exp(0.5 * log_var)
-        epsilon = torch.randn_like(var)
-        z = mean + var * epsilon
+    def kl_divergence(z, mu, std):
+        # --------------------------
+        # Monte carlo KL divergence
+        # --------------------------
+        # 1. define the first two probabilities (in this case Normal for both)
+        p = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(std))
+        q = torch.distributions.Normal(mu, std)
 
-        return z
+        # 2. get the probabilities from the equation
+        log_qzx = q.log_prob(z)
+        log_pz = p.log_prob(z)
+
+        # kl
+        kl = (log_qzx - log_pz)
+        kl = kl.sum(-1)
+        return kl
 
     def forward(self, x):
         mean, log_var = self.encoder(x)
-        z = self.reparametrize(mean, log_var)
+
+        # sample z from q
+        std = torch.exp(log_var / 2)
+        q = torch.distributions.Normal(mean, std)
+        z = q.rsample()
+
         y = self.decoder(z)
 
-        return y, mean, log_var
+        return y, mean, std, z
 
 
 class LitVAE(pl.LightningModule):
@@ -171,16 +199,25 @@ class LitVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        y_hat, mean, log_var = self.vae(x)
-        # reconstruction_loss = F.binary_cross_entropy(y, y_hat, reduction='sum')
-        reconstruction_loss = F.mse_loss(y, y_hat)
-        # db_loss = F.mse_loss(AF.amplitude_to_DB(y, 20., 1e-6, 1., 96.),
-        #                      AF.amplitude_to_DB(y_hat, 20., 1e-6, 1., 96.))
-        # reconstruction_loss = amp_loss + db_loss
-        kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp(), dim=1), dim=0)
-        loss = reconstruction_loss + x.shape[0] * kl_loss
-        self.log('train_loss', loss)
-        return loss
+        y_hat, mean, std, z = self.vae(x)
+
+        # both_y_hats = torch.cat([AF.amplitude_to_DB(y_hat, 20., 1e-6, 1., 96.), y_hat], dim=1)
+        # both_xs = torch.cat([AF.amplitude_to_DB(y, 20., 1e-6, 1., 96.), x], dim=1)
+
+        recon_loss = self.vae.gaussian_likelihood(y_hat, y)
+
+        kl = self.vae.kl_divergence(z, mean, std)
+
+        elbo = (kl - recon_loss)
+        elbo = elbo.mean()
+
+        self.log_dict({
+            'elbo': elbo,
+            'kl_loss': kl.mean(),
+            'recon_loss': recon_loss.mean(),
+        })
+
+        return elbo
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
@@ -191,10 +228,10 @@ def main():
     dataset = AudioDataset(Path('/home/kureta/Music/violin/Violin Samples'),
                            input_transforms=[unitify],
                            output_transforms=[unitify])
-    loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
+    loader = DataLoader(dataset, batch_size=512, shuffle=True, num_workers=8, pin_memory=True)
     vae = LitVAE()
 
-    trainer = pl.Trainer(accelerator='gpu', devices=1)
+    trainer = pl.Trainer(gpus=1)
     trainer.fit(model=vae, train_dataloaders=loader)
 
 
