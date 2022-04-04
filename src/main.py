@@ -54,15 +54,17 @@ class AudioDataset(Dataset):
         files = list(data_path.glob('*.npy'))
         files.sort()
         for f in tqdm(files):
-            spectra.append(np.load(f))
+            array = torch.from_numpy(np.load(f))
+            array = array.unfold(1, 128, 64).transpose(0, 1)
+            spectra.append(array)
 
-        self.dataset = np.concatenate(spectra, axis=1)
+        self.dataset = torch.cat(spectra, dim=0)
 
     def __len__(self):
-        return self.dataset.shape[1]
+        return self.dataset.shape[0]
 
     def __getitem__(self, index):
-        return self.dataset[:, index]
+        return self.dataset[index]
 
 
 class Encoder(nn.Module):
@@ -72,14 +74,13 @@ class Encoder(nn.Module):
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
-                nn.Linear(in_, out_),
-                # nn.InstanceNorm1d(out_),
+                nn.Conv1d(in_, out_, 5, padding='same', padding_mode='replicate'),
                 nn.LeakyReLU(0.2)
             ))
         self.enc = nn.Sequential(*layers)
-        self.complication = nn.Sequential(*[nn.Linear(64, 64)] * 4)
-        self.mean = nn.Linear(64, 64)
-        self.log_var = nn.Linear(64, 64)
+        self.complication = nn.Sequential(*[nn.Conv1d(64, 64, 1, padding='same', padding_mode='replicate')] * 4)
+        self.mean = nn.Conv1d(64, 64, 1, padding='same', padding_mode='replicate')
+        self.log_var = nn.Conv1d(64, 64, 1, padding='same', padding_mode='replicate')
 
     def forward(self, x):
         z = self.enc(x)
@@ -93,19 +94,18 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.complication = nn.Sequential(*[nn.Linear(64, 64)] * 4)
+        self.complication = nn.Sequential(*[nn.Conv1d(64, 64, 1, padding='same', padding_mode='replicate')] * 4)
 
         layer_sizes = [64, 128, 256, 512, 1024]
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
-                nn.Linear(in_, out_),
-                # nn.InstanceNorm1d(out_),
+                nn.Conv1d(in_, out_, 5, padding='same', padding_mode='replicate'),
                 nn.LeakyReLU(0.2)
             ))
 
         self.dec = nn.Sequential(*layers)
-        self.mean = nn.Linear(1024, 1024)
+        self.mean = nn.Conv1d(1024, 1024, 1, padding='same', padding_mode='replicate')
 
     def forward(self, z):
         w = self.complication(z)
@@ -128,7 +128,7 @@ class VAE(nn.Module):
 
         # measure prob of seeing image under p(x|z)
         log_pxz = dist.log_prob(x)
-        return log_pxz.sum(dim=1)
+        return log_pxz.sum(dim=(1, 2))
 
     @staticmethod
     def kl_divergence(z, mu, std):
@@ -145,7 +145,7 @@ class VAE(nn.Module):
 
         # kl
         kl = (log_qzx - log_pz)
-        kl = kl.sum(-1)
+        kl = kl.sum(dim=(1, 2))
         return kl
 
     def forward(self, x):
@@ -193,7 +193,7 @@ class LitVAE(pl.LightningModule):
 
 def main():
     dataset = AudioDataset(Path('/home/kureta/Music/cello/Cello Samples'))
-    loader = DataLoader(dataset, batch_size=512, shuffle=True, num_workers=8, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=8, pin_memory=True)
     vae = LitVAE()
 
     trainer = pl.Trainer(gpus=1)
