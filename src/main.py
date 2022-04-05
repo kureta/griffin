@@ -6,10 +6,29 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio.functional as AF
+import torchvision.transforms.functional as tvf
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
+
+from torchcrepe import predict
+from torchcrepe.decode import argmax
+
+CREPE_SAMPLE_RATE = 16000
+
+
+def next_power_of_2(n):
+    n = int(np.ceil(n))
+    if n and not (n & (n - 1)):
+        return n
+
+    p = 1
+    while p < n:
+        p <<= 1
+
+    return p
 
 
 def amp_to_db(s):
@@ -45,36 +64,75 @@ def prepare_intermediate_data(folder_path: Path,
     return data_path
 
 
+def prepare_pitches(folder_path: Path, sample_rate: int = 44100, n_fft: int = 2048, hop_length: int = 512):
+    crepe_hop_length = next_power_of_2(hop_length * CREPE_SAMPLE_RATE / sample_rate)
+    data_path = folder_path.parent / f'pitch-{sample_rate}-{n_fft}-{hop_length}'
+    try:
+        data_path.mkdir(exist_ok=False)
+    except FileExistsError:
+        print('Already pre-processed')
+        return data_path
+
+    def do_single_file(f):
+        y, sr = librosa.load(f, mono=True, sr=sample_rate)
+        assert sr == sample_rate
+        _, _, probs = predict(torch.from_numpy(y).unsqueeze(0), sample_rate=sample_rate, hop_length=crepe_hop_length,
+                              return_periodicity=True, device='cuda', decoder=argmax, batch_size=512)
+        probs = probs.argmax(dim=1)[0].cpu().numpy()
+        np.save(str(data_path / f'{str(f.stem)}.npy'), probs)
+
+    # convert to list to see tqdm info
+    files = list(folder_path.glob('*.wav'))
+    # sort for reproducible ordering
+    files.sort()
+    for f in tqdm(files):
+        do_single_file(f)
+
+    return data_path
+
+
 class AudioDataset(Dataset):
     def __init__(self, folder_path: Path,
                  sample_rate: int = 44100, n_fft: int = 2048, hop_length: int = 512):
         data_path = prepare_intermediate_data(folder_path, sample_rate, n_fft, hop_length)
+        pitch_path = prepare_pitches(folder_path, sample_rate, n_fft, hop_length)
 
         spectra = []
-        files = list(data_path.glob('*.npy'))
-        files.sort()
-        for f in tqdm(files):
-            array = torch.from_numpy(np.load(f))
+        pitches = []
+        spec_files = list(data_path.glob('*.npy'))
+        spec_files.sort()
+        pitch_files = list(pitch_path.glob('*.npy'))
+        pitch_files.sort()
+        for s, p in tqdm(zip(spec_files, pitch_files)):
+            s_array = torch.from_numpy(np.load(s))
+            array = torch.from_numpy(np.load(p))
+            array = tvf.resize(array.unsqueeze(0).unsqueeze(0), [1, s_array.shape[1]]).squeeze(1)
+
+            s_array = s_array.unfold(1, 128, 64).transpose(0, 1)
+            spectra.append(s_array)
+
             array = array.unfold(1, 128, 64).transpose(0, 1)
-            spectra.append(array)
+            pitches.append(array)
 
         self.dataset = torch.cat(spectra, dim=0)
+        self.pitchset = torch.cat(pitches, dim=0)
 
     def __len__(self):
         return self.dataset.shape[0]
 
     def __getitem__(self, index):
-        return self.dataset[index]
+        return self.dataset[index], F.one_hot(self.pitchset[index].squeeze(0), num_classes=360).T
 
 
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        layer_sizes = [1024, 512, 256, 128, 64]
+        layer_sizes = [1024 + 360, 512, 256, 128, 64]
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
                 nn.Conv1d(in_, out_, 5, padding='same', padding_mode='replicate'),
+                nn.GroupNorm(out_, out_),
                 nn.LeakyReLU(0.2)
             ))
         self.enc = nn.Sequential(*layers)
@@ -94,13 +152,15 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.complication = nn.Sequential(*[nn.Conv1d(64, 64, 1, padding='same', padding_mode='replicate')] * 4)
+        self.complication = nn.Sequential(
+            *[nn.Conv1d(64 + 360, 64 + 360, 1, padding='same', padding_mode='replicate')] * 4)
 
-        layer_sizes = [64, 128, 256, 512, 1024]
+        layer_sizes = [64 + 360, 128, 256, 512, 1024]
         layers = []
         for in_, out_ in zip(layer_sizes, layer_sizes[1:]):
             layers.append(nn.Sequential(
                 nn.Conv1d(in_, out_, 5, padding='same', padding_mode='replicate'),
+                nn.GroupNorm(out_, out_),
                 nn.LeakyReLU(0.2)
             ))
 
@@ -148,15 +208,17 @@ class VAE(nn.Module):
         kl = kl.sum(dim=(1, 2))
         return kl
 
-    def forward(self, x):
-        mu, log_var = self.encoder(x)
+    def forward(self, x, c):
+        feat = torch.cat([x, c], dim=1)
+        mu, log_var = self.encoder(feat)
 
         # sample z from q
         std = torch.exp(log_var / 2)
         q = torch.distributions.Normal(mu, std)
         z = q.rsample()
 
-        x_hat = self.decoder(z)
+        z_feat = torch.cat([z, c], dim=1)
+        x_hat = self.decoder(z_feat)
 
         return x_hat, mu, std, z
 
@@ -167,8 +229,8 @@ class LitVAE(pl.LightningModule):
         self.vae = VAE()
 
     def training_step(self, batch, batch_idx):
-        x = batch
-        x_hat, mean, std, z = self.vae(x)
+        x, c = batch
+        x_hat, mean, std, z = self.vae(x, c)
 
         recon_loss = self.vae.likelihood(x_hat, x)
 
@@ -187,7 +249,7 @@ class LitVAE(pl.LightningModule):
         return elbo
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
 
